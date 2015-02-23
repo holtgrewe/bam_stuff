@@ -113,8 +113,8 @@ private:
 
     // partition the given range of records at the same start position and
     // call markSingleEndDupes on each batch
-    void partitionAndMarkDupes(std::vector<seqan::BamAlignmentRecord *>::iterator itBegin,
-                               std::vector<seqan::BamAlignmentRecord *>::iterator itEnd);
+    void partitionAndMarkDupesSE(std::vector<seqan::BamAlignmentRecord *>::iterator itBegin,
+                                 std::vector<seqan::BamAlignmentRecord *>::iterator itEnd);
     // mark single-ended duplicates in already selected batch of duplicates
     void markSingleEndDupes(std::vector<seqan::BamAlignmentRecord *> & duplicates);
 
@@ -127,13 +127,15 @@ private:
     BamMarkDupOptions options;
 };
 
-void DuplicateBamProcessor::partitionAndMarkDupes(std::vector<seqan::BamAlignmentRecord *>::iterator itBegin,
-                                                  std::vector<seqan::BamAlignmentRecord *>::iterator itEnd)
+void DuplicateBamProcessor::partitionAndMarkDupesSE(std::vector<seqan::BamAlignmentRecord *>::iterator itBegin,
+                                                    std::vector<seqan::BamAlignmentRecord *>::iterator itEnd)
 {
     // partition the given range by (begin pos, end pos)
     std::map<std::pair<int, int>, std::vector<seqan::BamAlignmentRecord *>> partitions;
     for (auto it = itBegin; it != itEnd; ++it)
     {
+        if (hasFlagMultiple(**it) && !options.treatPairedAsSingle)
+            continue;  // ignore single-end reads
         int const beginPos = (*it)->beginPos;
         int const endPos = beginPos + getAlignmentLengthInRef(**it);
         partitions[std::make_pair(beginPos, endPos)].push_back(*it);
@@ -188,7 +190,7 @@ void DuplicateBamProcessor::process(bool isFinal)
 
     while (itBegin != buffer.end())
     {
-        // get range of equal records
+        // get range of records at equal start positions
         auto range = std::make_pair(itBegin, itBegin);
         while (range.second != buffer.end() && !isLeftOfPosOnly(**range.first, **range.second))
             ++range.second;
@@ -197,7 +199,7 @@ void DuplicateBamProcessor::process(bool isFinal)
         if (!isLeftOfPosOnly(**range.first, **(range.second - 1)) && !isFinal)
             break;  // last not greater than first
 
-        partitionAndMarkDupes(range.first, range.second);
+        partitionAndMarkDupesSE(range.first, range.second);
         itBegin = range.second;
     }
 

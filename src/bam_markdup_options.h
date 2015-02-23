@@ -71,8 +71,10 @@ public:
 
     // Maximal expected template size (ignore entries with larger TLEN).
     int windowLength;
+    // Force treating of paired reads as single-end reads.
+    bool treatPairedAsSingle;
 
-    BamMarkDupOptions() : verbosity(1), windowLength(40*1000)
+    BamMarkDupOptions() : verbosity(1), windowLength(40*1000), treatPairedAsSingle(false)
     {}
 
     void print(std::ostream & out) const;
