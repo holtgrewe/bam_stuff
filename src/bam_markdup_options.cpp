@@ -99,7 +99,7 @@ BamMarkDupOptions parseCommandLine(int argc, char ** argv)
 
     addOption(parser, seqan::ArgParseOption("", "window-length", "Window length.",
                                             seqan::ArgParseArgument::INTEGER, "LEN"));
-    setDefaultValue(parser, "window-length", 20*1000);
+    setDefaultValue(parser, "window-length", 4000);
 
     // Parse command line.
     seqan::ArgumentParser::ParseResult res = seqan::parse(parser, argc, argv);

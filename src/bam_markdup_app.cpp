@@ -42,10 +42,38 @@
 #include <seqan/seq_io.h>
 #include <seqan/simple_intervals_io.h>
 
-#include "version.h"
 #include "bam_markdup_options.h"
+#include "progress_indicator.h"
+#include "version.h"
 
 namespace {  // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// Function fileSize()
+// ---------------------------------------------------------------------------
+
+__uint64 fileSize(char const * path)
+{
+    std::ifstream in(path, std::ifstream::ate | std::ifstream::binary);
+    return in.tellg();
+}
+
+// ---------------------------------------------------------------------------
+// Function alignmentsStartInWindow()
+// ---------------------------------------------------------------------------
+
+// return true if the two alignments start within a window of the given size
+bool alignmentsStartInWindow(seqan::BamAlignmentRecord const & lhs,
+                             seqan::BamAlignmentRecord const & rhs,
+                             int windowSize)
+{
+    if (lhs.rID != rhs.rID)
+        return false;
+    if (lhs.rID == seqan::BamAlignmentRecord::INVALID_REFID ||
+        rhs.rID == seqan::BamAlignmentRecord::INVALID_REFID)
+        return false;
+    return (abs(lhs.beginPos - rhs.beginPos) < windowSize);
+}
 
 // ---------------------------------------------------------------------------
 // Function isLeftOf()
@@ -111,12 +139,23 @@ private:
     // process buffer; if isFinal then also write out the last segment
     void process(bool isFinal = false);
 
+    typedef std::vector<seqan::BamAlignmentRecord *>::iterator TIter;
+    typedef std::pair<TIter, TIter> TRange;
+
+    // processing of single-ended reads
+    void processSE(TRange window);
+    // processing of paired-ended reads
+    void processPE(TRange window);
+
     // partition the given range of records at the same start position and
     // call markSingleEndDupes on each batch
     void partitionAndMarkDupesSE(std::vector<seqan::BamAlignmentRecord *>::iterator itBegin,
                                  std::vector<seqan::BamAlignmentRecord *>::iterator itEnd);
     // mark single-ended duplicates in already selected batch of duplicates
     void markSingleEndDupes(std::vector<seqan::BamAlignmentRecord *> & duplicates);
+    // mark paired-end duplicates in already selected batch of duplicates
+    void markPairedEndDupes(
+            std::vector<std::pair<seqan::BamAlignmentRecord *, seqan::BamAlignmentRecord *>> & duplicates);
 
     // buffer with yet-to-be-processed records
     std::vector<seqan::BamAlignmentRecord *> buffer;
@@ -156,17 +195,42 @@ void DuplicateBamProcessor::markSingleEndDupes(std::vector<seqan::BamAlignmentRe
         return lhs->mapQ < rhs->mapQ;
     };
     auto best = std::max_element(duplicates.begin(), duplicates.end(), cmpMapQ);
-    if (options.verbosity >= 2)
+    if (options.verbosity >= 3)
         std::cerr << "best read: " << (*best)->qName << "/" << hasFlagLast(**best) + 1 << "\n";
 
     // mask all but best with appropriate BAM flag
     for (auto it = duplicates.begin(); it != duplicates.end(); ++it)
     {
-        if (options.verbosity >= 2)
-            std::cerr << "marking as duplicate: " << (*it)->qName << "/" << hasFlagLast(**it) + 1 << "\n";
+        if (options.verbosity >= 3)
+            std::cerr << "marking as SE duplicate: " << (*it)->qName << "/" << hasFlagLast(**it) + 1 << "\n";
         if (it != best)
             (*it)->flag |= seqan::BAM_FLAG_DUPLICATE;
     }
+}
+
+void DuplicateBamProcessor::markPairedEndDupes(
+        std::vector<std::pair<seqan::BamAlignmentRecord *, seqan::BamAlignmentRecord *>> & duplicates)
+{
+    if (duplicates.size() <= 1u)
+        return;
+
+    // obtain best by quality
+    auto cmpMapQ = [](std::pair<seqan::BamAlignmentRecord *, seqan::BamAlignmentRecord *> const & lhs,
+                      std::pair<seqan::BamAlignmentRecord *, seqan::BamAlignmentRecord *> const & rhs) {
+        return (lhs.first->mapQ + lhs.second->mapQ) < (rhs.first->mapQ + rhs.second->mapQ);
+    };
+    auto best = std::max_element(duplicates.begin(), duplicates.end(), cmpMapQ);
+    if (options.verbosity >= 3)
+        std::cerr << "best pair " << best->first->qName << "\n";
+
+    // mask all but best with appropriate BAM flag
+    for (auto it = duplicates.begin(); it != duplicates.end(); ++it)
+        if (it != best) {
+            if (options.verbosity >= 3)
+                std::cerr << "marking as PE duplicate: " << it->first->qName << "/" << hasFlagLast(*it->second) + 1 << "\n";
+            it->first->flag |= seqan::BAM_FLAG_DUPLICATE;
+            it->second->flag |= seqan::BAM_FLAG_DUPLICATE;
+        }
 }
 
 DuplicateBamProcessor::~DuplicateBamProcessor()
@@ -186,30 +250,127 @@ void DuplicateBamProcessor::push(std::vector<seqan::BamAlignmentRecord *> & reco
 
 void DuplicateBamProcessor::process(bool isFinal)
 {
-    auto itBegin = buffer.begin();
+    if (buffer.empty())
+        return;  // guard against empty buffer
+    if (options.verbosity >= 2)
+        std::cerr << "buffer size == " << buffer.size() << "\n";
 
-    while (itBegin != buffer.end())
+    // Get longest prefix of buffer, such that the rightmost read is more than options.windowLength from the last
+    // read in buffer. If this is the final alignment round (and no more alignments are expected) then consider
+    // all of buffer.
+    auto range = std::make_pair(buffer.begin(), buffer.begin());
+    if (isFinal)
+        range.second = buffer.end();
+    else
+        while (range.second != buffer.end() &&
+                !alignmentsStartInWindow(**range.second, **(buffer.end() - 1), options.windowLength))
+            ++range.second;
+
+    // Process single-end and paired-end records in range (options.windowLength > 1 ensures that SE processing
+    // works correctly).
+    processSE(range);
+    if (!options.treatPairedAsSingle)
+        processPE(range);
+
+    // write out all processed, free them, and remove them from buffer
+    for (auto it = range.first; it != range.second; ++it)
     {
+        writeRecord(bamFileOut, **it);
+        delete *it;
+    }
+    buffer.erase(range.first, range.second);
+}
+
+void DuplicateBamProcessor::processSE(TRange window)
+{
+    auto itBegin = window.first;
+
+    while (itBegin != window.second)
+    {
+        if (hasFlagUnmapped(**itBegin))
+            break;  // reached first unaligned record
+
         // get range of records at equal start positions
         auto range = std::make_pair(itBegin, itBegin);
-        while (range.second != buffer.end() && !isLeftOfPosOnly(**range.first, **range.second))
+        while (range.second != window.second && !isLeftOfPosOnly(**range.first, **range.second))
             ++range.second;
         if (range.first == range.second)
             break;  // range was empty
-        if (!isLeftOfPosOnly(**range.first, **(range.second - 1)) && !isFinal)
+        if (!isLeftOfPosOnly(**range.first, **(range.second - 1)))
             break;  // last not greater than first
 
         partitionAndMarkDupesSE(range.first, range.second);
         itBegin = range.second;
     }
+}
 
-    // write out all processed, free them, and remove them from buffer
-    for (auto it = buffer.begin(); it != itBegin; ++it)
+void DuplicateBamProcessor::processPE(TRange window)
+{
+    if (options.verbosity >= 3)
+        std::cerr << "PE WINDOW\n\n";
+
+    // obtain records, sorted by (qName, beginPos, firstFlag)
+    std::map<std::tuple<seqan::CharString, bool, int>, seqan::BamAlignmentRecord *> records;
+    for (auto elem : buffer)
+        if (hasFlagMultiple(*elem) && (!hasFlagUnmapped(*elem) || !hasFlagNextUnmapped(*elem))
+                && (elem->rID == elem->rNextId))
+        {
+            auto key = std::make_tuple(elem->qName, hasFlagLast(*elem), elem->beginPos);
+            if (records.find(key) != records.end())
+                std::cerr << "WARNING: found duplicate alignment for the same read " << elem->qName
+                          << "/" << (hasFlagLast(*elem)) << "\n";
+            records[key] = elem;
+            if (options.verbosity >= 3)
+                std::cerr << "(" << std::get<0>(key) << ", " << std::get<1>(key) << ", " << std::get<2>(key)
+                          << ") -> " << elem->qName << "/" << (hasFlagLast(*elem) + 1) << "\n";
+        }
+
+    // collect records, obtaining pairing
+    std::vector<std::pair<seqan::BamAlignmentRecord *, seqan::BamAlignmentRecord *>> pairs;
+    for (auto it = window.first; it != window.second; ++it)
+        if (hasFlagMultiple(**it)  // paired
+                && (!hasFlagUnmapped(**it) || !hasFlagNextUnmapped(**it))  // one mate aligned
+                && ((*it)->rID == (*it)->rNextId)  // aligned on same ref
+                && (std::make_pair((*it)->beginPos, hasFlagLast(**it))  // left, ties broken by first flag
+                    < std::make_pair((*it)->pNext, hasFlagLast(**it))))
+        {
+            auto key = std::make_tuple((*it)->qName, !hasFlagLast(**it), (*it)->pNext);
+            if (options.verbosity >= 3)
+                std::cerr << "Looking for (" << std::get<0>(key) << ", " << std::get<1>(key) << ", "
+                          << std::get<2>(key) << ")\n";
+            auto other = records.find(key);
+            if (other == records.end())
+            {
+                if (abs((*it)->pNext - (*it)->beginPos) < options.windowLength)
+                    std::cerr << "WARNING: could not find mate for " << (*it)->qName << "/" << (hasFlagLast(**it) + 1)
+                              << " (broken BAM file?)\n";
+                else if (options.verbosity >= 3)
+                    std::cerr << "INFO: ignoring "  << (*it)->qName << "/" << (hasFlagLast(**it) + 1)
+                              << " since mate is too far away.\n";
+            }
+            else if ((*it)->beginPos < other->second->beginPos)
+            {
+                pairs.push_back(std::make_pair(*it, other->second));
+            }
+            else
+            {
+                pairs.push_back(std::make_pair(other->second, *it));
+            }
+        }
+
+    // partition buffer, adding the necessary flags
+    typedef std::tuple<int, int, int, int> TKey;
+    typedef std::pair<seqan::BamAlignmentRecord *, seqan::BamAlignmentRecord *> TValue;
+    std::map<TKey, std::vector<TValue>> partitions;
+    for (auto pair : pairs)
     {
-        writeRecord(bamFileOut, **it);
-        delete *it;
+        TKey key(pair.first->beginPos, pair.first->beginPos + getAlignmentLengthInRef(*pair.first),
+                 pair.second->beginPos, pair.second->beginPos + getAlignmentLengthInRef(*pair.second));
+        partitions[key].push_back(pair);
     }
-    buffer.erase(buffer.begin(), itBegin);
+    // apply marks
+    for (auto & elem : partitions)
+        markPairedEndDupes(elem.second);
 }
 
 }  // anonymous namespace
@@ -283,8 +444,10 @@ void BamMarkDupAppImpl::openFiles()
                   << "\n";
     }
 
-    std::cerr << "Opening " << options.inPath << " ...\n";
-    if (!open(bamFileIn, options.inPath.c_str()))
+    std::cerr << "Opening " << options.inPath << " ...";
+    if (options.inPath == "-" && !open(bamFileIn, std::cin))
+        throw new std::runtime_error("Could not stdin for input.");
+    else if (options.inPath != "-" && !open(bamFileIn, options.inPath.c_str()))
         throw new std::runtime_error("Could not open input file.");
     std::cerr << " OK\n";
 
@@ -305,7 +468,7 @@ void BamMarkDupAppImpl::openFiles()
     appendValue(pgRecord.tags, seqan::BamHeaderRecord::TTag("DS", "masking of duplicate alignments"));
     appendValue(bamHeader, pgRecord);
 
-    std::cerr << "Opening " << options.outPath << " ...\n";
+    std::cerr << "Opening " << options.outPath << " ...";
     if (!open(bamFileOut, options.outPath.c_str()))
         throw new std::runtime_error("Could not open output file.");
     std::cerr << " OK\n";
@@ -314,22 +477,36 @@ void BamMarkDupAppImpl::openFiles()
 
 void BamMarkDupAppImpl::processRecords()
 {
+    unsigned const MIB = 1; //1024 * 1024;
     double startTime = seqan::sysTime();
+
+    std::unique_ptr<ProgressBar> progress;
+    progress.reset(new ProgressBar(std::cerr, 0, fileSize(options.inPath.c_str()) / MIB,
+                                   (options.verbosity == 1)));
+    progress->setLabel(options.inPath.c_str());
+    progress->updateDisplay();
 
     DuplicateBamProcessor processor(bamFileOut, options);
     std::vector<seqan::BamAlignmentRecord *> chunk;
-    size_t const CHUNK_SIZE = 10*1000;
+    size_t const CHUNK_SIZE = 1000;
     while (!atEnd(bamFileIn))
     {
-        // read in chunk and pus into processor
+        // read in chunk and put into processor
         while (chunk.size() < CHUNK_SIZE && !atEnd(bamFileIn))
         {
             std::unique_ptr<seqan::BamAlignmentRecord> ptr(new seqan::BamAlignmentRecord);
             readRecord(*ptr, bamFileIn);
             chunk.push_back(ptr.release());
         }
+        if (options.verbosity >= 2)
+            std::cerr << "reader at " << chunk.front()->rID << ":" << chunk.front()->beginPos << " (chunk size == " << chunk.size() << ")\n";
         processor.push(chunk);
+
+        // update progress bar
+        progress->advanceTo((position(bamFileIn) >> 16) / MIB);
     }
+
+    progress->finish();
 
     if (options.verbosity >= 1)
         std::cerr << "Masking time: " << (seqan::sysTime() - startTime) << " s\n";

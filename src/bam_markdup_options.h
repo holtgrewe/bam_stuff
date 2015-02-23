@@ -74,7 +74,7 @@ public:
     // Force treating of paired reads as single-end reads.
     bool treatPairedAsSingle;
 
-    BamMarkDupOptions() : verbosity(1), windowLength(40*1000), treatPairedAsSingle(false)
+    BamMarkDupOptions() : verbosity(1), windowLength(4000), treatPairedAsSingle(false)
     {}
 
     void print(std::ostream & out) const;
