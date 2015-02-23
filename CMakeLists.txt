@@ -1,8 +1,6 @@
 project (bam_markdup)
 cmake_minimum_required (VERSION 2.8)
 
-set (CMAKE_BUILD_TYPE RelWithDebInfo)
-
 # Make the SeqAn CMake modules available.
 set (CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH}
                        ${CMAKE_SOURCE_DIR}/ext/seqan/util/cmake)

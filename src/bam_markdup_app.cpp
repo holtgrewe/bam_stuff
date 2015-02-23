@@ -47,6 +47,10 @@
 
 namespace {  // anonymous namespace
 
+// ---------------------------------------------------------------------------
+// Function isLeftOf()
+// ---------------------------------------------------------------------------
+
 // Original comparison function for strings by Heng Li from samtools.
 
 inline int strnum_cmp(const char *a, const char *b)
@@ -69,11 +73,141 @@ inline int strnum_cmp(const char *a, const char *b)
     return *pa<*pb? -1 : *pa>*pb? 1 : 0;
 }
 
+// with tie-breaking by name
 bool isLeftOf(seqan::BamAlignmentRecord const & lhs, seqan::BamAlignmentRecord const & rhs)
 {
     return ((unsigned)lhs.rID < (unsigned)rhs.rID ||
             (lhs.rID == rhs.rID && lhs.beginPos < rhs.beginPos) ||
             (lhs.rID == rhs.rID && lhs.beginPos == rhs.beginPos && strnum_cmp(toCString(lhs.qName), toCString(rhs.qName)) < 0));
+}
+
+// without tie-breaking by name
+bool isLeftOfPosOnly(seqan::BamAlignmentRecord const & lhs, seqan::BamAlignmentRecord const & rhs)
+{
+    return ((unsigned)lhs.rID < (unsigned)rhs.rID || (lhs.rID == rhs.rID && lhs.beginPos < rhs.beginPos));
+}
+
+// ---------------------------------------------------------------------------
+// Class DuplicateBamProcessor
+// ---------------------------------------------------------------------------
+
+/*!
+ * Stream through BamAlignmentRecord objects and execute callback on batches of those aligning on duplicate positions.
+ */
+
+class DuplicateBamProcessor
+{
+public:
+    DuplicateBamProcessor(seqan::BamFileOut & bamFileOut, BamMarkDupOptions const & options) :
+        bamFileOut(bamFileOut), options(options)
+    {}
+
+    ~DuplicateBamProcessor();
+
+    void push(std::vector<seqan::BamAlignmentRecord *> & records);
+
+private:
+
+    // process buffer; if isFinal then also write out the last segment
+    void process(bool isFinal = false);
+
+    // partition the given range of records at the same start position and
+    // call markSingleEndDupes on each batch
+    void partitionAndMarkDupes(std::vector<seqan::BamAlignmentRecord *>::iterator itBegin,
+                               std::vector<seqan::BamAlignmentRecord *>::iterator itEnd);
+    // mark single-ended duplicates in already selected batch of duplicates
+    void markSingleEndDupes(std::vector<seqan::BamAlignmentRecord *> & duplicates);
+
+    // buffer with yet-to-be-processed records
+    std::vector<seqan::BamAlignmentRecord *> buffer;
+
+    // sink for processed BAM files
+    seqan::BamFileOut & bamFileOut;
+    // configuration
+    BamMarkDupOptions options;
+};
+
+void DuplicateBamProcessor::partitionAndMarkDupes(std::vector<seqan::BamAlignmentRecord *>::iterator itBegin,
+                                                  std::vector<seqan::BamAlignmentRecord *>::iterator itEnd)
+{
+    // partition the given range by (begin pos, end pos)
+    std::map<std::pair<int, int>, std::vector<seqan::BamAlignmentRecord *>> partitions;
+    for (auto it = itBegin; it != itEnd; ++it)
+    {
+        int const beginPos = (*it)->beginPos;
+        int const endPos = beginPos + getAlignmentLengthInRef(**it);
+        partitions[std::make_pair(beginPos, endPos)].push_back(*it);
+    }
+
+    // mark duplicates in each partition
+    for (auto & entry : partitions)
+        markSingleEndDupes(entry.second);
+}
+
+void DuplicateBamProcessor::markSingleEndDupes(std::vector<seqan::BamAlignmentRecord *> & duplicates)
+{
+    if (duplicates.size() <= 1u)
+        return;
+
+    // obtain best by quality
+    auto cmpMapQ = [](seqan::BamAlignmentRecord const * lhs, seqan::BamAlignmentRecord const * rhs) {
+        return lhs->mapQ < rhs->mapQ;
+    };
+    auto best = std::max_element(duplicates.begin(), duplicates.end(), cmpMapQ);
+    if (options.verbosity >= 2)
+        std::cerr << "best read: " << (*best)->qName << "/" << hasFlagLast(**best) + 1 << "\n";
+
+    // mask all but best with appropriate BAM flag
+    for (auto it = duplicates.begin(); it != duplicates.end(); ++it)
+    {
+        if (options.verbosity >= 2)
+            std::cerr << "marking as duplicate: " << (*it)->qName << "/" << hasFlagLast(**it) + 1 << "\n";
+        if (it != best)
+            (*it)->flag |= seqan::BAM_FLAG_DUPLICATE;
+    }
+}
+
+DuplicateBamProcessor::~DuplicateBamProcessor()
+{
+    // process buffer, setting isFinal flag to true
+    process(true);
+}
+
+void DuplicateBamProcessor::push(std::vector<seqan::BamAlignmentRecord *> & records)
+{
+    // move records to buffer
+    buffer.insert(buffer.end(), records.begin(), records.end());
+    records.clear();
+    // process buffer
+    process();
+}
+
+void DuplicateBamProcessor::process(bool isFinal)
+{
+    auto itBegin = buffer.begin();
+
+    while (itBegin != buffer.end())
+    {
+        // get range of equal records
+        auto range = std::make_pair(itBegin, itBegin);
+        while (range.second != buffer.end() && !isLeftOfPosOnly(**range.first, **range.second))
+            ++range.second;
+        if (range.first == range.second)
+            break;  // range was empty
+        if (!isLeftOfPosOnly(**range.first, **(range.second - 1)) && !isFinal)
+            break;  // last not greater than first
+
+        partitionAndMarkDupes(range.first, range.second);
+        itBegin = range.second;
+    }
+
+    // write out all processed, free them, and remove them from buffer
+    for (auto it = buffer.begin(); it != itBegin; ++it)
+    {
+        writeRecord(bamFileOut, **it);
+        delete *it;
+    }
+    buffer.erase(buffer.begin(), itBegin);
 }
 
 }  // anonymous namespace
@@ -103,8 +237,8 @@ private:
     BamMarkDupOptions options;
 
     // Objects used for I/O.
-    seqan::BamFileIn bamFileIn;
     seqan::BamFileOut bamFileOut;
+    seqan::BamFileIn bamFileIn;
 
     // BAM header is read into this variable.
     seqan::BamHeader bamHeader;
@@ -167,6 +301,7 @@ void BamMarkDupAppImpl::openFiles()
     appendValue(pgRecord.tags, seqan::BamHeaderRecord::TTag("VN", PROGRAM_VERSION));
     appendValue(pgRecord.tags, seqan::BamHeaderRecord::TTag("CL", commandLine.c_str()));
     appendValue(pgRecord.tags, seqan::BamHeaderRecord::TTag("DS", "masking of duplicate alignments"));
+    appendValue(bamHeader, pgRecord);
 
     std::cerr << "Opening " << options.outPath << " ...\n";
     if (!open(bamFileOut, options.outPath.c_str()))
@@ -179,7 +314,20 @@ void BamMarkDupAppImpl::processRecords()
 {
     double startTime = seqan::sysTime();
 
-
+    DuplicateBamProcessor processor(bamFileOut, options);
+    std::vector<seqan::BamAlignmentRecord *> chunk;
+    size_t const CHUNK_SIZE = 10*1000;
+    while (!atEnd(bamFileIn))
+    {
+        // read in chunk and pus into processor
+        while (chunk.size() < CHUNK_SIZE && !atEnd(bamFileIn))
+        {
+            std::unique_ptr<seqan::BamAlignmentRecord> ptr(new seqan::BamAlignmentRecord);
+            readRecord(*ptr, bamFileIn);
+            chunk.push_back(ptr.release());
+        }
+        processor.push(chunk);
+    }
 
     if (options.verbosity >= 1)
         std::cerr << "Masking time: " << (seqan::sysTime() - startTime) << " s\n";
