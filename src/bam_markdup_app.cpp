@@ -213,6 +213,8 @@ void DuplicateBamProcessor::partitionAndMarkDupesSE(std::vector<seqan::BamAlignm
     {
         if (hasFlagMultiple(**it) && !options.treatPairedAsSingle)
             continue;  // ignore single-end reads
+        if (hasFlagSupplementary(**it))
+            continue;  // ignore supplementary alignments
         int const beginPos = (*it)->beginPos;
         int const endPos = beginPos + getAlignmentLengthInRef(**it);
         partitions[std::make_pair(beginPos, endPos)].push_back(*it);
@@ -350,7 +352,9 @@ void DuplicateBamProcessor::processPE(TRange window)
     // obtain records, sorted by (qName, beginPos, firstFlag)
     std::unordered_map<std::tuple<seqan::CharString, bool, int>, seqan::BamAlignmentRecord *, MyHash> records;
     for (auto elem : buffer)
-        if (hasFlagMultiple(*elem) && (!hasFlagUnmapped(*elem) || !hasFlagNextUnmapped(*elem))
+        if (hasFlagMultiple(*elem)
+                && !hasFlagSupplementary(*elem)
+                && (!hasFlagUnmapped(*elem) || !hasFlagNextUnmapped(*elem))
                 && (elem->rID == elem->rNextId))
         {
             auto key = std::make_tuple(elem->qName, hasFlagLast(*elem), elem->beginPos);
@@ -367,6 +371,7 @@ void DuplicateBamProcessor::processPE(TRange window)
     std::vector<std::pair<seqan::BamAlignmentRecord *, seqan::BamAlignmentRecord *>> pairs;
     for (auto it = window.first; it != window.second; ++it)
         if (hasFlagMultiple(**it)  // paired
+                && !hasFlagSupplementary(**it)
                 && (!hasFlagUnmapped(**it) || !hasFlagNextUnmapped(**it))  // one mate aligned
                 && ((*it)->rID == (*it)->rNextId)  // aligned on same ref
                 && (std::make_pair((*it)->beginPos, hasFlagLast(**it))  // left, ties broken by first flag
