@@ -1,0 +1,3 @@
+[submodule "ext/seqan"]
+	path = ext/seqan
+	url = https://github.com/seqan/seqan.git
