@@ -25,6 +25,8 @@ add_executable (bam_markdup
                 bam_markdup_app.cpp
                 bam_markdup_app.h
                 bam_markdup_options.cpp
-                bam_markdup_options.h)
+                bam_markdup_options.h
+                progress_indicator.cpp
+                progress_indicator.h)
 
 target_link_libraries (bam_markdup ${SEQAN_LIBRARIES})
