@@ -531,7 +531,7 @@ void BamMarkDupAppImpl::processRecords()
 
     DuplicateBamProcessor processor(bamFileOut, options);
     std::vector<seqan::BamAlignmentRecord *> chunk;
-    size_t const CHUNK_SIZE = 1000;
+    size_t const CHUNK_SIZE = 10000;
     while (!atEnd(bamFileIn))
     {
         // read in chunk and put into processor
