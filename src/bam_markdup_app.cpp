@@ -37,6 +37,7 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <unordered_map>
 
 #include <seqan/bam_io.h>
 #include <seqan/seq_io.h>
@@ -47,6 +48,43 @@
 #include "version.h"
 
 namespace {  // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// Class MyHash
+// ---------------------------------------------------------------------------
+
+struct MyHash
+{
+public:
+    template <typename T, typename U>
+    std::size_t operator()(std::pair<T, U> const & x) const
+    {
+        return std::hash<T>()(x.first) ^ std::hash<U>()(x.second);
+    }
+
+    std::size_t hashCode(seqan::CharString const & str) const
+    {
+        std::size_t hash = 0, strlen = length(str), i;
+        if (strlen == 0)
+            return hash;
+        for (i = 0; i < strlen; i++)
+            hash = (31 * hash) + str[i];
+        return hash;
+    }
+
+    template <typename U, typename V>
+    std::size_t operator()(std::tuple<seqan::CharString, U, V> const & x) const
+    {
+        return hashCode(std::get<0>(x)) ^ std::hash<U>()(std::get<1>(x)) ^ std::hash<V>()(std::get<2>(x));
+    }
+
+    template <typename T, typename U, typename V, typename W>
+    std::size_t operator()(std::tuple<T, U, V, W> const & x) const
+    {
+        return std::hash<T>()(std::get<0>(x)) ^ std::hash<T>()(std::get<1>(x)) ^ std::hash<U>()(std::get<2>(x)) ^ std::hash<V>()(std::get<3>(x));
+    }
+
+};
 
 // ---------------------------------------------------------------------------
 // Function fileSize()
@@ -170,7 +208,7 @@ void DuplicateBamProcessor::partitionAndMarkDupesSE(std::vector<seqan::BamAlignm
                                                     std::vector<seqan::BamAlignmentRecord *>::iterator itEnd)
 {
     // partition the given range by (begin pos, end pos)
-    std::map<std::pair<int, int>, std::vector<seqan::BamAlignmentRecord *>> partitions;
+    std::unordered_map<std::pair<int, int>, std::vector<seqan::BamAlignmentRecord *>, MyHash> partitions;
     for (auto it = itBegin; it != itEnd; ++it)
     {
         if (hasFlagMultiple(**it) && !options.treatPairedAsSingle)
@@ -310,7 +348,7 @@ void DuplicateBamProcessor::processPE(TRange window)
         std::cerr << "PE WINDOW\n\n";
 
     // obtain records, sorted by (qName, beginPos, firstFlag)
-    std::map<std::tuple<seqan::CharString, bool, int>, seqan::BamAlignmentRecord *> records;
+    std::unordered_map<std::tuple<seqan::CharString, bool, int>, seqan::BamAlignmentRecord *, MyHash> records;
     for (auto elem : buffer)
         if (hasFlagMultiple(*elem) && (!hasFlagUnmapped(*elem) || !hasFlagNextUnmapped(*elem))
                 && (elem->rID == elem->rNextId))
@@ -361,7 +399,7 @@ void DuplicateBamProcessor::processPE(TRange window)
     // partition buffer, adding the necessary flags
     typedef std::tuple<int, int, int, int> TKey;
     typedef std::pair<seqan::BamAlignmentRecord *, seqan::BamAlignmentRecord *> TValue;
-    std::map<TKey, std::vector<TValue>> partitions;
+    std::unordered_map<TKey, std::vector<TValue>, MyHash> partitions;
     for (auto pair : pairs)
     {
         TKey key(pair.first->beginPos, pair.first->beginPos + getAlignmentLengthInRef(*pair.first),
